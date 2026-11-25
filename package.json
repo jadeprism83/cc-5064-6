@@ -1,0 +1,12 @@
+{
+  "name": "visibility-buffer-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two-stage visibility-buffer rendering prototype (WebGL2 pipeline + auxiliary CPU reference CLI)",
+  "scripts": {
+    "serve": "node server.js",
+    "visbuf": "node src/cli/visbuf.js",
+    "test": "node test/glsl-check.js && node test/run-tests.js"
+  }
+}

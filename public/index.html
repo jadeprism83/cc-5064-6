@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>可见性缓冲双阶段渲染原型</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#2a313c; --fg:#e6edf3; --mut:#8b949e; --acc:#58a6ff; --warn:#e3b341; --err:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding:12px 18px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header .sub { color:var(--mut); font-size:12px; }
+  .layout { display:grid; grid-template-columns: 280px 1fr; gap:0; min-height:calc(100vh - 52px); }
+  aside { background:var(--panel); border-right:1px solid var(--line); padding:14px; overflow:auto; }
+  main { padding:14px 18px; overflow:auto; }
+  .group { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:12px; }
+  .group h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0 0 8px; }
+  label.ctl { display:flex; align-items:center; gap:8px; margin:6px 0; cursor:pointer; }
+  select, button, input[type=range] { width:100%; }
+  select, button { background:#0d1117; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; }
+  button { cursor:pointer; margin-top:6px; }
+  button:hover { border-color:var(--acc); }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  .stat { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px dashed #222; }
+  .stat b { font-variant-numeric:tabular-nums; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .card .cap { display:flex; justify-content:space-between; align-items:center; padding:8px 10px; border-bottom:1px solid var(--line); font-weight:600; }
+  .card .cap .tag { font-weight:400; color:var(--mut); font-size:11px; }
+  canvas.view { width:100%; display:block; aspect-ratio: 4 / 3; background:#000; image-rendering:pixelated; }
+  .alerts { margin-top:10px; }
+  .alert { padding:8px 10px; border-radius:6px; margin-bottom:6px; font-size:12px; }
+  .alert.warn { background:rgba(227,179,65,.12); border:1px solid var(--warn); color:var(--warn); }
+  .alert.err { background:rgba(248,81,73,.12); border:1px solid var(--err); color:var(--err); }
+  .alert.ok { background:rgba(63,185,80,.1); border:1px solid #3fb950; color:#3fb950; }
+  .muted { color:var(--mut); }
+  .pill { font-size:11px; padding:1px 7px; border-radius:99px; border:1px solid var(--line); }
+  .pill.on { border-color:var(--acc); color:var(--acc); }
+  .matrow { display:flex; align-items:center; justify-content:space-between; gap:6px; padding:4px 0; }
+  .swatch { width:14px; height:14px; border-radius:3px; border:1px solid #000; }
+  code { background:#0d1117; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>可见性缓冲双阶段渲染原型</h1>
+  <span class="sub">阶段一仅写身份/重心，阶段二从身份数据重建属性并着色 — 无颜色缓存伪装，无重画几何</span>
+</header>
+<div class="layout">
+  <aside>
+    <div class="group">
+      <h2>管线控制</h2>
+      <label class="ctl"><input type="checkbox" id="run" checked /> 动态运行（动态模型）</label>
+      <label class="ctl"><input type="checkbox" id="reorder" /> 重排绘制批次（验证实例身份）</label>
+      <label class="ctl"><input type="checkbox" id="persp" checked /> 透视正确属性恢复</label>
+      <div class="muted" style="margin:4px 0 8px">关闭透视恢复会切换到仿射控制路径，差异图应增大。</div>
+      <label class="ctl">材质策略
+        <select id="matMode">
+          <option value="0">描述符快照（随可见缓冲保存）</option>
+          <option value="1">采样前按版本重新绑定</option>
+        </select>
+      </label>
+      <label class="ctl"><input type="checkbox" id="freezeSnap" /> 冻结描述符快照（编辑材质后观察版本错配）</label>
+      <button id="recapSnap">重新捕获当前描述符快照</button>
+    </div>
+
+    <div class="group">
+      <h2>调试视窗内容</h2>
+      <label class="ctl">结果区显示
+        <select id="outMode">
+          <option value="0">最终着色</option>
+          <option value="1">重建世界坐标</option>
+          <option value="2">重建法线</option>
+          <option value="3">重建 UV</option>
+          <option value="4">反照率</option>
+          <option value="5">可见性标识（假彩色）</option>
+        </select>
+      </label>
+      <label class="ctl"><input type="checkbox" id="ampDiff" /> 放大差异图 (×8)</label>
+    </div>
+
+    <div class="group">
+      <h2>材质（可编辑以触发版本）</h2>
+      <div id="matList"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="editTex">更换选中材质纹理</button>
+      </div>
+      <button id="editColor">随机调整选中材质基色（版本+1）</button>
+    </div>
+
+    <div class="group">
+      <h2>逐像素度量（解析 vs 前向）</h2>
+      <div class="stat"><span>覆盖像素</span><b id="stCovered">-</b></div>
+      <div class="stat"><span>背景/无效像素</span><b id="stInvalid">-</b></div>
+      <div class="stat"><span>平均差(0-255)</span><b id="stMean">-</b></div>
+      <div class="stat"><span>最大差(0-255)</span><b id="stMax">-</b></div>
+      <div class="stat"><span>覆盖率</span><b id="stCovPct">-</b></div>
+      <div class="alerts" id="alerts"></div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="grid">
+      <div class="card">
+        <div class="cap"><span>① 可见性标识缓冲</span><span class="tag">R32UI：有效位|实例|图元</span></div>
+        <canvas class="view" id="cIdentity"></canvas>
+      </div>
+      <div class="card">
+        <div class="cap"><span>② 重心缓冲</span><span class="tag">RGBA16F：bary.xyz + depth</span></div>
+        <canvas class="view" id="cBary"></canvas>
+      </div>
+      <div class="card">
+        <div class="cap"><span>③ 双阶段着色结果</span><span class="tag" id="tagResolve">从身份重建</span></div>
+        <canvas class="view" id="cResolve"></canvas>
+      </div>
+      <div class="card">
+        <div class="cap"><span>④ 常规前向参考</span><span class="tag">独立索引网格路径</span></div>
+        <canvas class="view" id="cForward"></canvas>
+      </div>
+      <div class="card">
+        <div class="cap"><span>⑤ 逐像素差异</span><span class="tag">|解析 − 前向|</span></div>
+        <canvas class="view" id="cDiff"></canvas>
+      </div>
+      <div class="card">
+        <div class="cap"><span>⑥ 像素探针</span><span class="tag">悬停查看身份与属性</span></div>
+        <canvas class="view" id="cProbe"></canvas>
+        <div style="padding:8px 10px" id="probeInfo" class="muted">在任意视窗上移动鼠标以读取该像素。</div>
+      </div>
+    </div>
+  </main>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
