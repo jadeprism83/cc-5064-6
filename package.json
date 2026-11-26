@@ -7,6 +7,6 @@
   "scripts": {
     "serve": "node server.js",
     "visbuf": "node src/cli/visbuf.js",
-    "test": "node test/glsl-check.js && node test/run-tests.js"
+    "test": "node test/glsl-check.js && node test/run-tests.js && node test/diagnostics-tests.js"
   }
 }

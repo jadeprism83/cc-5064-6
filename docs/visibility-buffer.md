@@ -34,11 +34,12 @@ public/
     debug-bary.frag       重心缓冲视窗
     diff.frag             解析结果与前向结果的逐像素差异
   data-tables.js          全局顶点表 / 索引表 / 几何表 / 三角形展开
-  scene.js                几何索引、实例变换、材质身份三张分离的表
-  materials.js            材质描述符、版本号、描述符快照表
-  geometry.js math.js     网格生成（含退化图元）与矩阵/法线数学
-src/cli/visbuf.js         CPU 两阶段参考实现（辅助命令行）
-test/                     GLSL 结构检查与管线不变量测试
+  scene.js                几何索引、实例变换、材质身份三张分离的表 + 删除后编号复用
+  materials.js            材质描述符、版本号、描述符快照表、卸载/重载
+  geometry.js math.js     网格生成（含退化图元、共享顶点楔形）与矩阵/法线数学
+  visibility-diagnostics.js 解码追踪、执行证据链、原因码、封存帧与重放（GPU/CPU 共用）
+src/cli/visbuf.js         CPU 两阶段参考实现 + 诊断/封存/卸载重放（辅助命令行）
+test/                     GLSL 结构检查、管线不变量、解码追踪与取证诊断测试
 ```
 
 ## 3. 两阶段数据流
@@ -118,10 +119,71 @@ test/                     GLSL 结构检查与管线不变量测试
 
 ```bash
 npm run serve      # 打开 http://localhost:8080/ （图形入口，需要 WebGL2 浏览器）
-npm test           # GLSL 结构检查 + 管线不变量
+npm test           # GLSL 结构检查 + 管线不变量 + 解码追踪/取证诊断
 npm run visbuf -- --width 320 --height 240 --reorder --out out
 npm run visbuf -- --affine --out out       # 仿射控制路径对照
 ```
 
 无头/无 WebGL2 环境下，`npm test` 与 `npm run visbuf` 仍可运行，用于核查身份/重心
 契约；完整着色画面请在支持 WebGL2 的浏览器中通过图形入口查看。
+
+## 10. 可见性解码追踪与像素取证诊断
+
+图形界面第 **⑦ 号视窗「可见性诊断（解码追踪）」** 是该能力的入口，侧栏
+「可见性取证与诊断」面板的按钮全部调用 `renderer.js` 的真实实现
+（`readVisibilityBuffers` / `traceVisibilityPixel` / `runVisibilityDiagnostics` /
+`captureVisFrameArchive` / `replayVisFrameArchive`），底层共用
+`public/visibility-diagnostics.js`。**不存在固定数据冒充的身份/着色图**：
+诊断图逐像素来自对 GPU 回读的 R32UI 身份与 RGBA16F 重心缓冲重新追踪。
+
+### 10.1 同一帧的两种用法
+- **实时显示**：`live` 模式下诊断视窗对当代可见缓冲节流复跑（stride 抽样 +
+  `LogBudget` 有界预算），一键「回到实时可见缓冲」即用当代资源重新生成。
+- **取证快照**：「封存当前可见性帧」把身份/重心/相机/实例/几何/材质描述符与
+  纹理冻结为 `vis-frame-archive`，可导出 JSON 长期保存；「重放封存帧」在材质
+  热换后仍逐像素还原捕获时的原三角颜色（测试断言逐像素一致）。
+
+### 10.2 执行证据链与原因码
+`tracePixel` 对每个像素按阶段记录证据：`decode → instance-table →
+geometry-table → vertex-fetch → attribute-recover → material-binding →
+material-shade → verify`。每个异常都归到明确 `ReasonCode` 与阶段，并附带
+恢复属性（世界坐标/法线/UV/反照率/权重）与像素差异：
+
+| 原因 | 阶段 | 含义 |
+| --- | --- | --- |
+| `instance-out-of-range` / `identity-corrupt` | decode / instance-table | 身份编码问题，洋红/红标记并中止 |
+| `geometry-unloaded` / `material-unloaded` | geometry-table / material-binding | 旧编号资源已卸载，标出缺失依赖并**停在那次绘制** |
+| `material-stale-binding` | material-binding | 编号复用/热换后首次读到旧属性，记录绑定版本与实时版本 |
+| `material-boundary` | material-shade | 实例重用边界或材质自身纹素边界，与属性错读区分 |
+| `bary-non-normalized` / `bary-perspective-mismatch` / `attribute-misread` | attribute-recover / verify | 属性错读，定位到恢复阶段并记录像素差异 |
+| `shared-vertex-derivative` / `out-of-bounds-fetch` | vertex-fetch | 共享顶点导数与越界读取区分，可回溯实际被着色三角形 |
+
+干净帧只允许出现 `clean` / `background` / `material-boundary`，诊断器**不允许
+伪报**（由 `clean frame produces no false-positive anomaly codes` 测试守护）。
+
+### 10.3 编号复用与缺失依赖
+- 「模拟删除后编号复用」调用 `deleteAndReuseInstanceId`：删除实例并把其编号
+  复用到几何/材质不同的新物体，重放旧单帧时凭三角标识与材质版本在
+  **material-binding** 阶段标出陈旧绑定，而不是把新物体属性静默当成旧像素。
+- 「模拟旧编号资源卸载」会把几何/材质标记卸载，重放时诊断器聚合
+  `missingDependencies` 并把对应像素着成原因标记色，绘制在该处中止。
+- 「复位场景与资源」恢复实例编排、重载材质并回到实时缓冲。
+
+### 10.4 日志成本控制
+整帧分析采用 `stride` 抽样与 `LogBudget(maxEvents,maxPixels)` 双上限，超预算即
+截断并在结果中置 `truncated`；GUI 实时诊断默认每 12 帧复跑一次，避免取证日志
+拖慢动画。`log budget caps forensic log cost` 测试验证上限生效。
+
+### 10.5 命令行辅助（不替代图形入口）
+`npm run visbuf` 仅作离线核查，新增标志：
+
+```bash
+npm run visbuf -- --diagnose                       # 复跑追踪，输出原因分布与有界日志
+npm run visbuf -- --archive --out out              # 额外写出 vis-frame.json 取证快照
+npm run visbuf -- --archive --unload-material 1 \
+                 --unload-geometry 0 --out out     # 卸载重放，报缺失依赖并中止
+```
+
+不带新标志的旧调用与旧 `vis-frame.json` 仍运行到底（向后兼容由
+`archived frame JSON round-trips` 测试覆盖）。
+

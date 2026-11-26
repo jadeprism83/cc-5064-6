@@ -91,6 +91,21 @@
     </div>
 
     <div class="group">
+      <h2>可见性取证与诊断</h2>
+      <div class="muted" style="margin-bottom:6px">同一可见性帧既可实时显示，也可封存为像素取证快照；按钮全部调用真实可见性缓冲实现。</div>
+      <button id="captureFrame">封存当前可见性帧（取证快照）</button>
+      <button id="diagFrame">对当前可见缓冲复跑诊断</button>
+      <div class="row" style="margin-top:6px">
+        <button id="replayArchive">重放封存帧（还原原色）</button>
+        <button id="liveView">回到实时可见缓冲</button>
+      </div>
+      <button id="simUnload">模拟旧编号资源卸载后重放</button>
+      <button id="simReuse">模拟删除后编号复用（材质版本追踪）</button>
+      <button id="resetScene">复位场景与资源</button>
+      <div id="diagSummary" class="muted" style="margin-top:8px">尚未运行诊断。</div>
+    </div>
+
+    <div class="group">
       <h2>逐像素度量（解析 vs 前向）</h2>
       <div class="stat"><span>覆盖像素</span><b id="stCovered">-</b></div>
       <div class="stat"><span>背景/无效像素</span><b id="stInvalid">-</b></div>
@@ -127,6 +142,13 @@
         <div class="cap"><span>⑥ 像素探针</span><span class="tag">悬停查看身份与属性</span></div>
         <canvas class="view" id="cProbe"></canvas>
         <div style="padding:8px 10px" id="probeInfo" class="muted">在任意视窗上移动鼠标以读取该像素。</div>
+      </div>
+      <div class="card">
+        <div class="cap"><span>⑦ 可见性诊断（解码追踪）</span><span class="tag" id="tagDiag">实时结果 · 原因码联动</span></div>
+        <canvas class="view" id="cDiag"></canvas>
+        <div style="padding:8px 10px" id="diagInfo" class="muted">
+          封存/重放/诊断后在此显示可见性标识、着色图与对应原因；悬停可回溯实际被着色的三角形。
+        </div>
       </div>
     </div>
   </main>

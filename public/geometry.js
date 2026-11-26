@@ -100,3 +100,19 @@ export function makeDegeneratePatch() {
   out.indices.push(a, b, c, b, c, d);
   return out;
 }
+
+// 共享顶点楔形网格：两个三角形沿一条共享边相接，4 个顶点、2 个三角形。
+// 共享边的两个顶点被两个三角形复用（索引相同），用于区分三类问题：
+//  1) 身份编码：每个片元仍凭实例号/图元号定位到"实际被着色的三角形"；
+//  2) 导数：共享顶点处法线导数由相邻三角形决定，诊断需回溯到具体三角形；
+//  3) 越界读取：所有索引都在 4 个顶点内，正常情况绝不触发越界。
+export function makeSharedWedge() {
+  const out = empty();
+  const v0 = pushVertex(out, [-1, -0.8, 0], [0, 0, 1], [0, 0]);
+  const v1 = pushVertex(out, [0, 0.4, 0], [0, 0, 1], [0.5, 0.5]); // 共享边顶点
+  const v2 = pushVertex(out, [1, -0.8, 0], [0, 0, 1], [1, 0]);
+  const v3 = pushVertex(out, [0, 0.9, 0.6], [0, 0, 1], [0.5, 1]);  // 共享边顶点
+  // tri0 = v0,v1,v3 ; tri1 = v1,v2,v3 —— v1/v3 被两三角形共享。
+  out.indices.push(v0, v1, v3, v1, v2, v3);
+  return out;
+}

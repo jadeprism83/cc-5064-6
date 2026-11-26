@@ -26,3 +26,5 @@ __pycache__/
 out/
 /vis-shaded.png
 /vis-identity.png
+/vis-frame.json
+/vis-replay.png

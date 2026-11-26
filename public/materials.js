@@ -39,9 +39,10 @@ export function makeTexture(kind, size = 128) {
 
 let MAT_ID = 0;
 
-export function createMaterial({ name, texture, baseColor, roughness = 0.6, metalness = 0.0 }) {
+export function createMaterial({ name, texture, baseColor, roughness = 0.6, metalness = 0.0, id }) {
   return {
-    id: MAT_ID++,
+    // 显式 id 由调用方按表位置给出；缺省时回退到模块计数，保证独立调用仍唯一。
+    id: id ?? MAT_ID++,
     version: 0,
     name,
     texture,            // {kind,size,data}
@@ -60,6 +61,24 @@ export function publishEdit(material, patch) {
   Object.assign(material, patch);
   material.version += 1;
   material.descriptorToken += 1;
+  return material;
+}
+
+// 标记材质卸载：保留旧编号与版本记录，但纹理/描述符资源不再可用。
+// 封存帧重放遇到它时，诊断器必须报 MATERIAL_UNLOADED 并停在那次绘制。
+export function unloadMaterial(material) {
+  material.unloaded = true;
+  material._unloadedTexture = material.texture;
+  material.texture = { kind: 'unloaded', size: 0, data: new Uint8Array(0) };
+  return material;
+}
+
+// 重新装载材质（当代资源），实时视口可据此重新生成可见缓冲。
+export function reloadMaterial(material, texture) {
+  material.unloaded = false;
+  if (material._unloadedTexture && !texture) material.texture = material._unloadedTexture;
+  else if (texture) material.texture = texture;
+  material._unloadedTexture = null;
   return material;
 }
 

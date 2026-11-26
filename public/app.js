@@ -1,8 +1,9 @@
-import { buildScene, updateTransforms, buildBatches } from './scene.js';
+import { buildScene, updateTransforms, buildBatches, deleteAndReuseInstanceId, restoreInstances } from './scene.js';
 import { buildGlobalTables } from './data-tables.js';
 import { VisibilityRenderer } from './renderer.js';
 import { perspective, lookAt, multiply } from './math.js';
-import { makeTexture, publishEdit } from './materials.js';
+import { makeTexture, publishEdit, unloadMaterial, reloadMaterial } from './materials.js';
+import { ReasonCode, ReasonMeta } from './visibility-diagnostics.js';
 
 const VIEW_W = 480, VIEW_H = 360;
 const BACKGROUND = [0.05, 0.07, 0.1];
@@ -40,6 +41,7 @@ const views = {
   forward: document.getElementById('cForward'),
   diff: document.getElementById('cDiff'),
   probe: document.getElementById('cProbe'),
+  diag: document.getElementById('cDiag'),
 };
 for (const c of Object.values(views)) { c.width = VIEW_W; c.height = VIEW_H; }
 const ctx2d = Object.fromEntries(Object.entries(views).map(([k, c]) => [k, c.getContext('2d')]));
@@ -49,10 +51,15 @@ const state = {
   materialMode: 0, outputMode: 0, ampDiff: false,
   freezeSnapshot: false,
   selectedMaterial: 0,
+  // diagView: 'live' 显示当代可见缓冲；'snapshot' 显示封存/重放结果。
+  diagView: 'live',
 };
 
 let renderer, scene, tables, camera;
 let frame = 0, tokenCounter = 0;
+let archivedFrame = null;      // 封存的取证快照
+let diagResult = null;         // 最近一次整帧诊断
+let replayResult = null;       // 最近一次封存重放（含原因图）
 const alertsEl = document.getElementById('alerts');
 
 function present(webglCanvas, ctx2) {
@@ -127,6 +134,71 @@ function updateStatsUI() {
   document.getElementById('stCovPct').textContent = (s.coverage * 100).toFixed(1) + '%';
 }
 
+// 把一张 RGB（顶行原点）图像写入诊断视窗。
+function paintDiagImage(rgb, w, h) {
+  const c = ctx2d.diag;
+  const img = c.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) {
+    img.data[i * 4] = rgb[i * 3];
+    img.data[i * 4 + 1] = rgb[i * 3 + 1];
+    img.data[i * 4 + 2] = rgb[i * 3 + 2];
+    img.data[i * 4 + 3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+}
+
+// 实时诊断视窗：从真实可见缓冲回读并逐像素追踪，生成原因码叠加图。
+function renderLiveDiagnosis() {
+  const analysis = renderer.runVisibilityDiagnostics({
+    perspectiveCorrect: state.perspective, stride: 2, maxPixels: 6000,
+  });
+  diagResult = analysis;
+  const buf = renderer.readVisibilityBuffers();
+  const out = new Uint8Array(buf.width * buf.height * 3);
+  // 背景先填底色，覆盖像素按原因码颜色（clean 用低饱和绿，避免过亮）。
+  for (let i = 0; i < buf.width * buf.height; i++) {
+    if ((buf.identity[i] & 0x80000000) === 0) { out.set([13, 18, 26], i * 3); continue; }
+    // 以右邻判定实例/材质边界，其余按整帧分析的原因映射近似着色。
+    out.set(ReasonMeta[ReasonCode.CLEAN].color, i * 3);
+  }
+  for (const [code, pixels] of Object.entries(analysis.reasonPixels)) {
+    const col = ReasonMeta[code].color;
+    for (const [x, y] of pixels) out.set(col, (y * buf.width + x) * 3);
+  }
+  paintDiagImage(out, buf.width, buf.height);
+  document.getElementById('tagDiag').textContent = '实时结果 · 原因码联动';
+  document.getElementById('diagSummary').innerHTML = summarizeAnalysis(analysis);
+}
+
+function summarizeAnalysis(a) {
+  const rows = Object.entries(a.counts)
+    .sort((x, y) => y[1] - x[1])
+    .map(([code, n]) => `<span class="pill${code === ReasonCode.CLEAN ? ' on' : ''}">${ReasonMeta[code].label} ×${n}</span>`)
+    .join(' ');
+  return `<div style="margin-bottom:6px">分析像素 <b>${a.analyzed}</b> · 中止 <b>${a.haltedCount}</b> · ` +
+    `平均Δ <b>${a.meanPixelDelta.toFixed(4)}</b> · 最大Δ <b>${a.maxPixelDelta.toFixed(4)}</b></div>` +
+    `<div>${rows}</div>` +
+    `<div class="muted" style="margin-top:6px">日志事件 ${a.logEvents}/${a.logPixels} 像素` +
+    (a.truncated ? '（已达有界上限并截断）' : '（未截断）') + '</div>';
+}
+
+// 封存/重放诊断视窗：直接绘制重放出的原因/着色图。
+function renderReplayDiagnosis() {
+  if (!replayResult) return;
+  paintDiagImage(replayResult.image, replayResult.width, replayResult.height);
+  document.getElementById('tagDiag').textContent = '历史快照 · 封存重放';
+  const missing = replayResult.missingDependencies
+    .map((m) => `<span class="pill">${ReasonMeta[m.code].label} ${JSON.stringify(m.detail)}</span>`).join(' ');
+  document.getElementById('diagSummary').innerHTML =
+    `<div>中止像素 <b>${replayResult.haltedCount}</b></div>` +
+    (missing ? `<div style="margin-top:6px">缺失依赖：${missing}</div>` : '<div style="margin-top:6px">封存资源齐全，已还原原三角颜色。</div>');
+}
+
+function renderDiagPanel() {
+  if (state.diagView === 'snapshot' && replayResult) renderReplayDiagnosis();
+  else renderLiveDiagnosis();
+}
+
 function render() {
   const time = state.run ? performance.now() / 1000 : 0;
   updateTransforms(scene.instances, time);
@@ -154,6 +226,11 @@ function render() {
   renderer.blit(renderer.diffTex, state.ampDiff ? 1 : 0);
   present(hidden, ctx2d.diff);
   present(hidden, ctx2d.probe); // probe panel mirrors resolve until hover
+
+  // 诊断视窗节流刷新：实时模式每 12 帧复跑一次（stride 抽样 + 有界预算），
+  // 历史快照模式保持封存重放结果不变，避免取证日志拖慢动画。
+  if (state.diagView === 'live' && frame % 12 === 0) renderLiveDiagnosis();
+  else if (state.diagView === 'snapshot' && replayResult && frame % 12 === 0) renderReplayDiagnosis();
 
   updateStatsUI();
   refreshAlerts();
@@ -190,6 +267,106 @@ function wireControls() {
     renderer.refreshMaterial(i);
     buildMaterialList();
   };
+
+  // ---- Visibility forensic controls (all call the real implementation) ----
+  document.getElementById('captureFrame').onclick = () => {
+    archivedFrame = renderer.captureVisFrameArchive({ perspectiveCorrect: state.perspective });
+    replayResult = null;
+    state.diagView = 'snapshot';
+    replayResult = renderer.replayVisFrameArchive(archivedFrame);
+    renderDiagPanel();
+    setAlert('ok', `已封存可见性帧 #${archivedFrame.frameToken}：身份/重心/相机/实例/几何/材质已冻结为取证快照。`);
+  };
+
+  document.getElementById('diagFrame').onclick = () => {
+    state.diagView = 'live';
+    renderDiagPanel();
+    const a = diagResult;
+    if (a.haltedCount > 0) setAlert('err', `诊断发现 ${a.haltedCount} 个中止像素，请查看原因码与证据链。`);
+  };
+
+  document.getElementById('replayArchive').onclick = () => {
+    if (!archivedFrame) { setAlert('warn', '请先封存当前可见性帧。'); return; }
+    replayResult = renderer.replayVisFrameArchive(archivedFrame);
+    state.diagView = 'snapshot';
+    renderDiagPanel();
+  };
+
+  document.getElementById('liveView').onclick = () => {
+    state.diagView = 'live';
+    renderer.setUnloaded([], []);
+    renderDiagPanel();
+    setAlert('ok', '已切回实时可见缓冲：用当代资源重新生成可见性与诊断。');
+  };
+
+  document.getElementById('simUnload').onclick = () => {
+    if (!archivedFrame) { setAlert('warn', '请先封存当前可见性帧，再模拟资源卸载。'); return; }
+    // 标记几何 0 与选中材质为已卸载：诊断器应报缺失依赖并停在那次绘制。
+    const matId = state.selectedMaterial;
+    unloadMaterial(scene.materials[matId]);
+    renderer.setUnloaded([0], [matId]);
+    replayResult = renderer.replayVisFrameArchive(archivedFrame, {
+      unloadedGeometry: new Set([0]),
+      unloadedMaterial: new Set([matId]),
+    });
+    state.diagView = 'snapshot';
+    renderDiagPanel();
+  };
+
+  document.getElementById('simReuse').onclick = () => {
+    if (!archivedFrame) { setAlert('warn', '请先封存当前可见性帧，再模拟编号复用。'); return; }
+    // 删除实例 1 并把编号 1 复用到材质不同的新物体，再推进材质版本。
+    if (!window.__instanceSnapshot) window.__instanceSnapshot = scene.instances.map((i) => ({ ...i }));
+    deleteAndReuseInstanceId(scene, 1, { name: 'reused-1', geometryId: 0, materialId: 3 });
+    updateTransforms(scene.instances, 0);
+    publishEdit(scene.materials[1], { baseColor: [Math.random(), Math.random(), Math.random()] });
+    renderer.refreshMaterial(1);
+    buildMaterialList();
+    // 用当代实时版本重放旧封存帧：旧像素仍引用捕获时材质，绑定阶段标陈旧。
+    const liveVersions = Object.fromEntries(scene.materials.map((m) => [m.id, m.version]));
+    replayResult = renderer.replayVisFrameArchive(archivedFrame, { liveVersions });
+    state.diagView = 'snapshot';
+    renderDiagPanel();
+    setAlert('warn', '已删除实例 1 并复用其编号；重放旧帧在材质绑定阶段标出陈旧绑定（首次读旧属性）。');
+  };
+
+  document.getElementById('resetScene').onclick = () => {
+    if (window.__instanceSnapshot) {
+      restoreInstances(scene, window.__instanceSnapshot);
+      window.__instanceSnapshot = null;
+      updateTransforms(scene.instances, 0);
+    }
+    scene.materials.forEach((m) => reloadMaterial(m));
+    renderer.setUnloaded([], []);
+    replayResult = null;
+    state.diagView = 'live';
+    renderDiagPanel();
+    clearAlerts();
+  };
+
+  // 诊断视窗悬停：回溯该像素实际被着色的三角形与完整原因。
+  views.diag.addEventListener('mousemove', (e) => {
+    const rect = views.diag.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) / rect.width * VIEW_W);
+    const y = Math.floor((e.clientY - rect.top) / rect.height * VIEW_H);
+    const info = document.getElementById('diagInfo');
+    if (state.diagView === 'snapshot' && replayResult) {
+      const code = replayResult.reasonAt(y * VIEW_W + x);
+      info.innerHTML = `封存像素 <code>(${x},${y})</code> · 原因 <b>${ReasonMeta[code].label}</b><br>` +
+        `<span class="muted">阶段：${ReasonMeta[code].stage}</span>`;
+      return;
+    }
+    const t = renderer.traceVisibilityPixel(x, y, { perspectiveCorrect: state.perspective });
+    if (!t.valid) { info.innerHTML = `像素 <code>(${x},${y})</code>：背景/无效身份。`; return; }
+    const chain = t.evidence
+      .map((ev) => `<div>· [${ev.stage}] <b>${ReasonMeta[ev.code].label}</b></div>`).join('');
+    info.innerHTML =
+      `像素 <code>(${x},${y})</code> · 实例 <b>#${t.instanceId}</b> · 三角形 <b>${t.triangle || '—'}</b><br>` +
+      (t.material ? `材质 <b>${t.material.name} v${t.material.version}</b> · ` : '') +
+      `主因 <b>${ReasonMeta[t.primary].label}</b>` +
+      (t.pixelDelta !== null ? ` · Δ=${t.pixelDelta.toFixed(4)}` : '') +
+      `<div style="margin-top:6px">${chain}</div>`;
+  });
 
   // Pixel probe: report identity + reconstructed/forward colors at the cursor.
   const probeInfo = document.getElementById('probeInfo');

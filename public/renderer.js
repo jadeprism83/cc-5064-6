@@ -1,5 +1,9 @@
 import { expandTriangleSoup } from './data-tables.js';
 import { normalMatrix } from './math.js';
+import {
+  LogBudget, tracePixel, analyzeVisibilityFrame,
+  buildVisFrameArchive, replayArchive,
+} from './visibility-diagnostics.js';
 
 function compile(gl, type, src) {
   const sh = gl.createShader(type);
@@ -22,6 +26,17 @@ function program(gl, vsSrc, fsSrc) {
     throw new Error('Program link error: ' + gl.getProgramInfoLog(p));
   }
   return p;
+}
+
+// Decode an IEEE 754 half-float (uint16) to a JS number, for RGBA16F readback
+// on devices that only expose EXT_color_buffer_half_float.
+function halfFloatToNumber(h) {
+  const sign = (h & 0x8000) ? -1 : 1;
+  const exp = (h >> 10) & 0x1f;
+  const frac = h & 0x3ff;
+  if (exp === 0) return sign * Math.pow(2, -14) * (frac / 1024);
+  if (exp === 31) return frac ? NaN : sign * Infinity;
+  return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
 }
 
 export class VisibilityRenderer {
@@ -251,6 +266,8 @@ export class VisibilityRenderer {
   renderFrame(camera, batches, opts) {
     const gl = this.gl;
     const { view, viewProj, camPos, background } = camera;
+    this._lastViewProj = viewProj;
+    this._lastCamPos = camPos;
     // In snapshot strategy the descriptor is frozen with the visibility buffer
     // until explicitly released; rebind strategy always sees live materials.
     if (!opts.freezeSnapshot) this.captureSnapshot();
@@ -536,6 +553,144 @@ export class VisibilityRenderer {
     gl.readPixels(x, fy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, out);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     return out;
+  }
+
+  // ---- Visibility decode tracing & forensic capture --------------------
+  // 全部基于真实 GPU 可见性缓冲回读，再交给共享诊断实现；不使用固定数据。
+
+  // 回读当前身份(R32UI)与重心(RGBA16F)缓冲，并把 GL 底行原点翻转为顶行原点。
+  readVisibilityBuffers() {
+    const gl = this.gl, w = this.canvas.width, h = this.canvas.height;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.visFB);
+    const rawId = new Uint32Array(w * h);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.readPixels(0, 0, w, h, gl.RED_INTEGER, gl.UNSIGNED_INT, rawId);
+    const rawBary = new Float32Array(w * h * 4);
+    gl.readBuffer(gl.COLOR_ATTACHMENT1);
+    // RGBA16F 在支持 EXT_color_buffer_float 时可按 FLOAT 回读；否则按 HALF_FLOAT。
+    if (this.ext.colorFloat) {
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, rawBary);
+    } else {
+      const half = new Uint16Array(w * h * 4);
+      gl.readPixels(0, 0, w, h, gl.RGBA, gl.HALF_FLOAT, half);
+      for (let i = 0; i < half.length; i++) rawBary[i] = halfFloatToNumber(half[i]);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    const identity = new Uint32Array(w * h);
+    const bary = new Float32Array(w * h * 3);
+    for (let y = 0; y < h; y++) {
+      const srcRow = h - 1 - y;
+      for (let x = 0; x < w; x++) {
+        const src = srcRow * w + x, dst = y * w + x;
+        identity[dst] = rawId[src];
+        bary[dst * 3] = rawBary[src * 4];
+        bary[dst * 3 + 1] = rawBary[src * 4 + 1];
+        bary[dst * 3 + 2] = rawBary[src * 4 + 2];
+      }
+    }
+    return { width: w, height: h, identity, bary };
+  }
+
+  // 实时场景解析器：把当前 WebGL 场景/全局表适配到诊断三表接口。
+  _liveDiagnosticResolver() {
+    const scene = this.scene, tables = this.tables;
+    return {
+      resolveInstance: (id) => {
+        const ins = scene.instances[id];
+        if (!ins) return null;
+        const mat = scene.materials[ins.materialId];
+        return {
+          id: ins.id, name: ins.name,
+          geometryId: ins.geometryId, materialId: ins.materialId,
+          model: ins.model, normalMat: normalMatrix(ins.model),
+          materialVersion: mat ? mat.version : 0,
+        };
+      },
+      resolveGeometry: (id) => {
+        const g = scene.geometryById.get(id);
+        if (!g) return null;
+        if (this._unloadedGeometry && this._unloadedGeometry.has(id)) return { id, name: g.name, unloaded: true };
+        const info = tables.geomInfo.find((x) => x.id === id);
+        return {
+          id, name: g.name,
+          vertStart: info.vertStart, indexStart: info.indexStart,
+          triCount: info.triCount, vertexCount: info.vertexCount,
+          positions: g.mesh.positions, normals: g.mesh.normals,
+          uvs: g.mesh.uvs, indices: g.mesh.indices,
+        };
+      },
+      resolveMaterial: (id) => {
+        const m = scene.materials[id];
+        if (!m) return null;
+        if ((this._unloadedMaterial && this._unloadedMaterial.has(id)) || m.unloaded) {
+          return { id, name: m.name, unloaded: true };
+        }
+        return {
+          id: m.id, name: m.name, version: m.version, liveVersion: m.version,
+          baseColor: m.baseColor, roughness: m.roughness, metalness: m.metalness,
+          texture: m.texture,
+        };
+      },
+    };
+  }
+
+  // 单像素追踪：返回带阶段证据链、恢复属性与原因的完整取证记录。
+  traceVisibilityPixel(x, y, opts = {}) {
+    const buf = this.readVisibilityBuffers();
+    const pi = y * buf.width + x;
+    return tracePixel(buf.identity[pi], buf.bary.subarray(pi * 3, pi * 3 + 3), {
+      resolver: this._liveDiagnosticResolver(),
+      viewProj: this._lastViewProj,
+      camPos: this._lastCamPos,
+      perspectiveCorrect: opts.perspectiveCorrect !== false,
+      neighborPacked: x + 1 < buf.width ? buf.identity[pi + 1] : buf.identity[pi],
+    });
+  }
+
+  // 整帧诊断：对真实可见性缓冲复跑追踪，原因分布 + 有界日志。
+  runVisibilityDiagnostics(opts = {}) {
+    const buf = this.readVisibilityBuffers();
+    return analyzeVisibilityFrame(buf, {
+      resolver: this._liveDiagnosticResolver(),
+      viewProj: this._lastViewProj,
+      camPos: this._lastCamPos,
+      perspectiveCorrect: opts.perspectiveCorrect !== false,
+    }, {
+      stride: opts.stride || 2,
+      budget: new LogBudget({ maxEvents: opts.maxEvents || 2000, maxPixels: opts.maxPixels || 4096 }),
+    });
+  }
+
+  // 把当前可见性帧封存为像素取证快照（冻结身份/重心/相机/实例/几何/材质）。
+  captureVisFrameArchive(opts = {}) {
+    const buf = this.readVisibilityBuffers();
+    const archiveScene = {
+      instances: this.scene.instances,
+      geometries: this.scene.geometries,
+      materials: this.scene.materials,
+      geomInfo: this.tables.geomInfo,
+    };
+    this._lastArchive = buildVisFrameArchive(
+      { ...buf, viewProj: this._lastViewProj, camPos: this._lastCamPos },
+      archiveScene,
+      { frameToken: this.visToken || 0, perspectiveCorrect: opts.perspectiveCorrect !== false },
+    );
+    return this._lastArchive;
+  }
+
+  // 重放封存帧。unloaded* 用于演示旧编号资源卸载；liveVersions 演示热换/复用。
+  replayVisFrameArchive(archive = this._lastArchive, opts = {}) {
+    return replayArchive(archive, {
+      unloadedGeometry: opts.unloadedGeometry || new Set(),
+      unloadedMaterial: opts.unloadedMaterial || new Set(),
+      liveVersions: opts.liveVersions,
+    });
+  }
+
+  setUnloaded(geometryIds = [], materialIds = []) {
+    this._unloadedGeometry = new Set(geometryIds);
+    this._unloadedMaterial = new Set(materialIds);
   }
 
   resize(w, h) {

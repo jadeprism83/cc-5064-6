@@ -10,12 +10,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { encodePNG } from './png.js';
+import {
+  ReasonCode, ReasonMeta, LogBudget, tracePixel, analyzeVisibilityFrame,
+  buildVisFrameArchive, replayArchive,
+} from '../../public/visibility-diagnostics.js';
+import { normalMatrix } from '../../public/math.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, '..', '..', 'public');
 const { buildScene, updateTransforms, buildBatches } = await import(path.join(PUBLIC, 'scene.js'));
 const { buildGlobalTables } = await import(path.join(PUBLIC, 'data-tables.js'));
-const { perspective, lookAt, multiply, normalMatrix, transformDir3 } = await import(path.join(PUBLIC, 'math.js'));
+const { perspective, lookAt, multiply } = await import(path.join(PUBLIC, 'math.js'));
 
 function mat4mul(a, b) { return multiply(a, b); }
 function apply4(m, p) {
@@ -27,8 +32,50 @@ function apply4(m, p) {
     m[3] * x + m[7] * y + m[11] * z + m[15],
   ];
 }
-function norm3(a) { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; }
-function dot3(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+// 实时场景解析器：把当前 scene/tables 适配成诊断模块的三表解析接口。
+// 与 GPU 解析路径读取同一组几何/实例/材质表，保证诊断回溯到真实着色三角形。
+export function liveSceneResolver(scene, tables, opts = {}) {
+  const unloadedGeometry = opts.unloadedGeometry || new Set();
+  const unloadedMaterial = opts.unloadedMaterial || new Set();
+  return {
+    resolveInstance(id) {
+      const ins = scene.instances.find((i) => i.id === id);
+      if (!ins) return null;
+      const mat = scene.materials[ins.materialId];
+      return {
+        id: ins.id, name: ins.name,
+        geometryId: ins.geometryId, materialId: ins.materialId,
+        model: ins.model,
+        normalMat: normalMatrix(ins.model),
+        materialVersion: mat ? mat.version : 0,
+      };
+    },
+    resolveGeometry(id) {
+      const g = scene.geometryById.get(id);
+      if (!g) return null;
+      const info = tables.geomInfo.find((x) => x.id === id);
+      if (unloadedGeometry.has(id)) return { id, name: g.name, unloaded: true };
+      return {
+        id, name: g.name,
+        vertStart: info.vertStart, indexStart: info.indexStart,
+        triCount: info.triCount, vertexCount: info.vertexCount,
+        positions: g.mesh.positions, normals: g.mesh.normals,
+        uvs: g.mesh.uvs, indices: g.mesh.indices,
+      };
+    },
+    resolveMaterial(id, version) {
+      const m = scene.materials[id];
+      if (!m) return null;
+      if (unloadedMaterial.has(id) || m.unloaded) return { id, name: m.name, unloaded: true };
+      return {
+        id: m.id, name: m.name, version: m.version, liveVersion: m.version,
+        baseColor: m.baseColor, roughness: m.roughness, metalness: m.metalness,
+        texture: m.texture,
+      };
+    },
+  };
+}
 
 // Perspective divide + NDC near/far clip (clip space -w..w). Returns null if
 // the triangle is fully outside; otherwise clips against the six planes.
@@ -68,9 +115,11 @@ function interpClip(a, b, t) {
 
 export function runSoftwarePipeline(opts = {}) {
   const W = opts.width || 320, H = opts.height || 240;
-  const scene = buildScene();
-  updateTransforms(scene.instances, opts.time || 0);
-  const tables = buildGlobalTables(scene.geometries);
+  // 允许调用方注入受控场景（共享顶点/实例复用/编号复用测试）；默认自建。
+  const scene = opts.scene || buildScene();
+  if (!opts.scene) updateTransforms(scene.instances, opts.time || 0);
+  else if (opts.updateTransforms !== false) updateTransforms(scene.instances, opts.time || 0);
+  const tables = opts.tables || buildGlobalTables(scene.geometries);
   const batches = buildBatches(scene.instances, !!opts.reorder);
 
   const proj = perspective(Math.PI / 4, W / H, 0.1, 100);
@@ -115,10 +164,17 @@ export function runSoftwarePipeline(opts = {}) {
     }
   }
 
-  // Stage 2: resolve + shade purely from visibility buffers.
+  // Stage 2: resolve + shade purely from visibility buffers, using the shared
+  // diagnostic tracer so CLI and GUI follow one execution-evidence chain.
   const image = new Uint8Array(W * H * 3);
   const identityViz = new Uint8Array(W * H * 3);
-  let covered = 0, invalid = 0;
+  const reasonMap = new Uint8Array(W * H);
+  const reasonIndex = Object.fromEntries(Object.values(ReasonCode).map((c, i) => [c, i + 1]));
+  const indexReason = Object.fromEntries(Object.entries(reasonIndex).map(([k, v]) => [v, k]));
+  const resolver = liveSceneResolver(scene, tables, opts);
+  const traceCtx = { resolver, viewProj: vp, camPos: eye, perspectiveCorrect: opts.perspective !== false };
+  let covered = 0, invalid = 0, halted = 0;
+  const reasonCounts = {};
   for (let py = 0; py < H; py++) {
     for (let px = 0; px < W; px++) {
       const pi = py * W + px;
@@ -126,6 +182,7 @@ export function runSoftwarePipeline(opts = {}) {
         invalid++;
         const bg = [13, 18, 26];
         image.set(bg, pi * 3); identityViz.set(bg, pi * 3);
+        reasonMap[pi] = reasonIndex[ReasonCode.BACKGROUND];
         continue;
       }
       covered++;
@@ -133,16 +190,29 @@ export function runSoftwarePipeline(opts = {}) {
       const instanceId = (packed >> 16) & 0xff;
       const primitiveId = packed & 0xffff;
       identityViz.set(falseColor(instanceId, primitiveId), pi * 3);
-      const col = resolvePixel(scene, tables, vp, eye, instanceId, primitiveId,
-        bary.subarray(pi * 3, pi * 3 + 3), opts.perspective !== false);
-      image.set(col, pi * 3);
+      const t = tracePixel(packed, bary.subarray(pi * 3, pi * 3 + 3), {
+        ...traceCtx,
+        neighborPacked: px + 1 < W ? identity[pi + 1] : packed,
+      });
+      reasonMap[pi] = reasonIndex[t.primary];
+      reasonCounts[t.primary] = (reasonCounts[t.primary] || 0) + 1;
+      if (t.halted) {
+        halted++;
+        image.set(ReasonMeta[t.primary].color, pi * 3);
+      } else {
+        image.set([Math.round(t.rgb[0] * 255), Math.round(t.rgb[1] * 255), Math.round(t.rgb[2] * 255)], pi * 3);
+      }
     }
   }
 
   return {
     width: W, height: H, image, identityViz,
     identity, bary, depth,
-    stats: { drawnTris, clippedTris, degenerate, covered, invalid, total: W * H },
+    reasonMap, reasonAt: (pi) => (reasonMap[pi] ? indexReason[reasonMap[pi]] : ReasonCode.BACKGROUND),
+    reasonCounts,
+    resolver, traceCtx,
+    scene, tables, viewProj: vp, camPos: eye,
+    stats: { drawnTris, clippedTris, degenerate, covered, invalid, halted, total: W * H },
   };
 }
 
@@ -184,62 +254,9 @@ function rasterTriangle(screen, ndc, instanceId, tri, W, H, identity, bary, dept
   }
 }
 
-// Reconstruct object attributes from identity + bary, then transform & shade.
-function resolvePixel(scene, tables, vp, eye, instanceId, primitiveId, b, perspectiveCorrect) {
-  const ins = scene.instances[instanceId];
-  const geom = scene.geometryById.get(ins.geometryId);
-  const ginfo = tables.geomInfo.find((g) => g.id === geom.id);
-  if (primitiveId >= ginfo.triCount) return [255, 0, 0];
-  const ids = [0, 1, 2].map((c) => geom.mesh.indices[primitiveId * 3 + c]);
-  const P = ids.map((vi) => [
-    geom.mesh.positions[vi * 3], geom.mesh.positions[vi * 3 + 1], geom.mesh.positions[vi * 3 + 2]]);
-  const N = ids.map((vi) => norm3([
-    geom.mesh.normals[vi * 3], geom.mesh.normals[vi * 3 + 1], geom.mesh.normals[vi * 3 + 2]]));
-  const UV = ids.map((vi) => [geom.mesh.uvs[vi * 2], geom.mesh.uvs[vi * 2 + 1]]);
-
-  let w;
-  if (perspectiveCorrect) {
-    const inv = P.map((p) => 1 / apply4(mat4mul(vp, ins.model), p)[3]);
-    const persp = [b[0] / inv[0], b[1] / inv[1], b[2] / inv[2]];
-    const s = persp.reduce((a, c) => a + c, 0);
-    w = persp.map((v) => v / s);
-  } else {
-    const s = b[0] + b[1] + b[2]; w = [b[0] / s, b[1] / s, b[2] / s];
-  }
-  const objPos = [0, 1, 2].map((k) => w[0] * P[0][k] + w[1] * P[1][k] + w[2] * P[2][k]);
-  const objNrm = [0, 1, 2].map((k) => w[0] * N[0][k] + w[1] * N[1][k] + w[2] * N[2][k]);
-  const uv = [w[0] * UV[0][0] + w[1] * UV[1][0] + w[2] * UV[2][0],
-              w[0] * UV[0][1] + w[1] * UV[1][1] + w[2] * UV[2][1]];
-
-  const wp = apply4(ins.model, objPos);
-  const worldPos = [wp[0] / wp[3], wp[1] / wp[3], wp[2] / wp[3]];
-  const nmat = normalMatrix(ins.model);
-  const Nw = norm3(transformDir3(nmat, objNrm));
-
-  const mat = scene.materials[ins.materialId];
-  const tex = sampleTexture(mat.texture, uv);
-  const albedo = [tex[0] * mat.baseColor[0], tex[1] * mat.baseColor[1], tex[2] * mat.baseColor[2]];
-  const L = norm3([0.6, 0.9, 0.4]);
-  const V = norm3([eye[0] - worldPos[0], eye[1] - worldPos[1], eye[2] - worldPos[2]]);
-  const H = norm3([L[0] + V[0], L[1] + V[1], L[2] + V[2]]);
-  const ndl = Math.max(dot3(Nw, L), 0);
-  const spec = Math.pow(Math.max(dot3(Nw, H), 0), 8 + (1 - mat.roughness) * 88) * (1 - mat.metalness * 0.5);
-  const shade = albedo.map((a) => {
-    const amb = a * 0.25;
-    const dif = a * ndl * (1 - mat.metalness * 0.7);
-    const sp = (1 - mat.metalness) * spec;
-    return Math.min(255, Math.round((amb + dif + sp) * 255));
-  });
-  return shade;
-}
-
-function sampleTexture(tex, uv) {
-  const u = ((uv[0] % 1) + 1) % 1, v = ((uv[1] % 1) + 1) % 1;
-  const x = Math.min(tex.size - 1, Math.floor(u * tex.size));
-  const y = Math.min(tex.size - 1, Math.floor(v * tex.size));
-  const i = (y * tex.size + x) * 4;
-  return [tex.data[i] / 255, tex.data[i + 1] / 255, tex.data[i + 2] / 255];
-}
+// Reconstruct/resolve now lives in the shared diagnostic tracer
+// (public/visibility-diagnostics.js tracePixel); this CLI rasterizer only owns
+// stage-1 rasterization and delegates every attribute/material decision to it.
 
 function falseColor(instance, primitive) {
   const hi = (Math.sin(instance * 12.9898 + primitive * 78.233) * 43758.5453) % 1;
@@ -249,7 +266,11 @@ function falseColor(instance, primitive) {
 }
 
 function parseArgs(argv) {
-  const opts = { width: 320, height: 240, time: 0, perspective: true, reorder: false, outDir: process.cwd() };
+  const opts = {
+    width: 320, height: 240, time: 0, perspective: true, reorder: false,
+    outDir: process.cwd(), diagnose: false, archive: false,
+    unloadGeometry: [], unloadMaterial: [], stride: 2,
+  };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--width') opts.width = parseInt(argv[++i], 10);
@@ -257,14 +278,25 @@ function parseArgs(argv) {
     else if (a === '--time') opts.time = parseFloat(argv[++i]);
     else if (a === '--reorder') opts.reorder = true;
     else if (a === '--affine') opts.perspective = false;
+    else if (a === '--diagnose') opts.diagnose = true;
+    else if (a === '--archive') opts.archive = true;
+    else if (a === '--stride') opts.stride = parseInt(argv[++i], 10);
+    else if (a === '--unload-geometry') opts.unloadGeometry.push(parseInt(argv[++i], 10));
+    else if (a === '--unload-material') opts.unloadMaterial.push(parseInt(argv[++i], 10));
     else if (a === '--out') opts.outDir = argv[++i];
   }
   return opts;
 }
 
+// 旧样例（无新参数）必须运行到底：默认只产出身份/着色两张 PNG 与统计。
 if (import.meta.url === `file://${process.argv[1]}`) {
   const opts = parseArgs(process.argv);
-  const result = runSoftwarePipeline(opts);
+  const diagOpts = {
+    ...opts,
+    unloadedGeometry: new Set(opts.unloadGeometry),
+    unloadedMaterial: new Set(opts.unloadMaterial),
+  };
+  const result = runSoftwarePipeline(diagOpts);
   fs.mkdirSync(opts.outDir, { recursive: true });
   const shadedPath = path.join(opts.outDir, 'vis-shaded.png');
   const idPath = path.join(opts.outDir, 'vis-identity.png');
@@ -274,4 +306,61 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   console.log('  shaded image   :', shadedPath);
   console.log('  identity buffer:', idPath);
   console.log('  stats          :', JSON.stringify(result.stats));
+
+  // 封存帧：把同一可见性帧冻结为像素取证快照（含解析所需的全部资源）。
+  let archive = null;
+  if (opts.archive) {
+    const archiveScene = { ...result.scene, geomInfo: result.tables.geomInfo };
+    archive = buildVisFrameArchive(
+      {
+        width: result.width, height: result.height,
+        identity: result.identity, bary: result.bary,
+        viewProj: result.viewProj, camPos: result.camPos,
+      },
+      archiveScene,
+      { perspectiveCorrect: opts.perspective, frameToken: 0 },
+    );
+    const archivePath = path.join(opts.outDir, 'vis-frame.json');
+    fs.writeFileSync(archivePath, JSON.stringify(archive));
+    console.log('  frame archive  :', archivePath);
+  }
+
+  // 诊断：对可见性缓冲复跑追踪，输出原因分布与有界日志成本。
+  if (opts.diagnose) {
+    const analysis = analyzeVisibilityFrame(
+      { width: result.width, height: result.height, identity: result.identity, bary: result.bary },
+      result.traceCtx,
+      { stride: opts.stride, budget: new LogBudget() },
+    );
+    console.log('  diagnosis      :', JSON.stringify({
+      analyzed: analysis.analyzed,
+      halted: analysis.haltedCount,
+      reasonCounts: analysis.counts,
+      meanPixelDelta: Number(analysis.meanPixelDelta.toFixed(4)),
+      maxPixelDelta: Number(analysis.maxPixelDelta.toFixed(4)),
+      truncated: analysis.truncated,
+      logEvents: analysis.logEvents,
+      logPixels: analysis.logPixels,
+    }));
+    if (analysis.samples.length) {
+      console.log('  first evidence chain:');
+      const s = analysis.samples[0];
+      for (const e of s.evidence) {
+        console.log(`    - [${e.stage}] ${e.code} ${JSON.stringify(e.detail)}`);
+      }
+    }
+  }
+
+  // 卸载重放：仅有旧编号、资源已卸载时，标出缺失依赖并停在那次绘制。
+  if (archive && (opts.unloadGeometry.length || opts.unloadMaterial.length)) {
+    const replay = replayArchive(archive, {
+      unloadedGeometry: new Set(opts.unloadGeometry),
+      unloadedMaterial: new Set(opts.unloadMaterial),
+    });
+    const replayPath = path.join(opts.outDir, 'vis-replay.png');
+    fs.writeFileSync(replayPath, encodePNG(replay.width, replay.height, replay.image));
+    console.log('  replay image   :', replayPath);
+    console.log('  halted pixels  :', replay.haltedCount);
+    console.log('  missing deps   :', JSON.stringify(replay.missingDependencies));
+  }
 }
